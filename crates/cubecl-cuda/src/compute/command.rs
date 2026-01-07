@@ -24,9 +24,7 @@ use cubecl_runtime::{
     memory_management::{MemoryAllocationMode, MemoryHandle},
     stream::{GcTask, ResolvedStreams},
 };
-use cudarc::driver::sys::{
-    CUDA_MEMCPY2D_st, CUmemorytype, CUstream_st, CUtensorMap, cuMemcpy2DAsync_v2,
-};
+use cudarc::driver::sys::{CUstream_st, CUtensorMap};
 use std::{ffi::c_void, ops::DerefMut, sync::Arc};
 
 #[derive(new)]
@@ -281,7 +279,7 @@ impl<'a> Command<'a> {
             binding,
             shape,
             strides,
-            elem_size,
+            ..
         } = descriptor;
 
         if !valid_strides(shape, strides) {
@@ -297,7 +295,7 @@ impl<'a> Command<'a> {
         };
 
         unsafe {
-            write_to_cpu(shape, strides, elem_size, bytes, resource.ptr, stream.sys)?;
+            write_contiguous_bytes_to_cpu(bytes, resource.ptr, stream.sys)?;
         }
 
         Ok(())
@@ -323,7 +321,7 @@ impl<'a> Command<'a> {
             binding,
             shape,
             strides,
-            elem_size,
+            ..
         } = descriptor;
         if !valid_strides(shape, strides) {
             return Err(IoError::UnsupportedStrides {
@@ -344,7 +342,7 @@ impl<'a> Command<'a> {
         };
         let current = self.streams.current();
 
-        unsafe { write_to_gpu(shape, strides, elem_size, &data, resource.ptr, current.sys) }?;
+        unsafe { write_contiguous_bytes_to_gpu(resource.ptr, &data, current.sys) }?;
 
         // Make sure we don't reuse the pinned memory until the write to gpu is completed.
         let event = Fence::new(current.sys);
@@ -378,12 +376,9 @@ impl<'a> Command<'a> {
         let current = self.streams.current();
 
         unsafe {
-            write_to_gpu(
-                desc.shape,
-                desc.strides,
-                desc.elem_size,
-                data,
+            write_contiguous_bytes_to_gpu(
                 resource.ptr,
+                data,
                 current.sys,
             )?;
         };
@@ -460,122 +455,40 @@ impl<'a> Command<'a> {
 
 #[cfg_attr(
     feature = "tracing",
-    tracing::instrument(level = "trace", skip(strides, data, dst_ptr, stream))
+    tracing::instrument(level = "trace", skip(target_ptr, source, stream))
 )]
-pub(crate) unsafe fn write_to_gpu(
-    shape: &[usize],
-    strides: &[usize],
-    elem_size: usize,
-    data: &[u8],
-    dst_ptr: u64,
+pub(crate) unsafe fn write_contiguous_bytes_to_gpu(
+    target_ptr: u64,
+    source: &[u8],
     stream: *mut CUstream_st,
 ) -> Result<(), IoError> {
-    let rank = shape.len();
-    if rank > 1 {
-        let dim_x = shape[rank - 1];
-        let width_bytes = dim_x * elem_size;
-        let dim_y: usize = shape.iter().rev().skip(1).product();
-        let pitch = strides[rank - 2] * elem_size;
-
-        let cpy = CUDA_MEMCPY2D_st {
-            srcMemoryType: CUmemorytype::CU_MEMORYTYPE_HOST,
-            srcHost: data.as_ptr() as *const c_void,
-            srcPitch: width_bytes,
-            dstMemoryType: CUmemorytype::CU_MEMORYTYPE_DEVICE,
-            dstDevice: dst_ptr,
-            dstPitch: pitch,
-            WidthInBytes: width_bytes,
-            Height: dim_y,
-            srcXInBytes: Default::default(),
-            srcY: Default::default(),
-            srcDevice: Default::default(),
-            srcArray: Default::default(),
-            dstXInBytes: Default::default(),
-            dstY: Default::default(),
-            dstHost: Default::default(),
-            dstArray: Default::default(),
-        };
-
         unsafe {
-            cuMemcpy2DAsync_v2(&cpy, stream)
-                .result()
-                .map_err(|e| IoError::Unknown {
-                    description: format!("CUDA memcpy failed: {e}"),
-                    backtrace: BackTrace::capture(),
-                })?;
-        }
-    } else {
-        unsafe {
-            cudarc::driver::result::memcpy_htod_async(dst_ptr, data, stream).map_err(|e| {
+            cudarc::driver::result::memcpy_htod_async(target_ptr, source, stream).map_err(|e| {
                 IoError::Unknown {
                     description: format!("CUDA 2D memcpy failed: {e}"),
                     backtrace: BackTrace::capture(),
                 }
             })?;
         }
-    };
 
     Ok(())
 }
 
 #[cfg_attr(
     feature = "tracing",
-    tracing::instrument(level = "trace", skip(strides, bytes, resource_ptr, stream))
+    tracing::instrument(level = "trace", skip(target, source_ptr, stream))
 )]
-pub(crate) unsafe fn write_to_cpu(
-    shape: &[usize],
-    strides: &[usize],
-    elem_size: usize,
-    bytes: &mut Bytes,
-    resource_ptr: u64,
+pub(crate) unsafe fn write_contiguous_bytes_to_cpu(
+    target: &mut Bytes,
+    source_ptr: u64,
     stream: *mut CUstream_st,
 ) -> Result<(), IoError> {
-    let rank = shape.len();
-
-    if rank <= 1 {
         unsafe {
-            cudarc::driver::result::memcpy_dtoh_async(bytes.deref_mut(), resource_ptr, stream)
+            cudarc::driver::result::memcpy_dtoh_async(target.deref_mut(), source_ptr, stream)
                 .map_err(|e| IoError::Unknown {
                     description: format!("CUDA memcpy failed: {e}"),
                     backtrace: BackTrace::capture(),
                 })?;
         }
-        return Ok(());
-    }
-
-    let dim_x = shape[rank - 1];
-    let width_bytes = dim_x * elem_size;
-    let dim_y: usize = shape.iter().rev().skip(1).product();
-    let pitch = strides[rank - 2] * elem_size;
-    let slice = bytes.deref_mut();
-
-    let cpy = CUDA_MEMCPY2D_st {
-        srcMemoryType: CUmemorytype::CU_MEMORYTYPE_DEVICE,
-        srcDevice: resource_ptr,
-        srcPitch: pitch,
-        dstMemoryType: CUmemorytype::CU_MEMORYTYPE_HOST,
-        dstHost: slice.as_mut_ptr() as *mut c_void,
-        dstPitch: width_bytes,
-        WidthInBytes: width_bytes,
-        Height: dim_y,
-        srcXInBytes: Default::default(),
-        srcY: Default::default(),
-        srcArray: Default::default(),
-        dstXInBytes: Default::default(),
-        dstY: Default::default(),
-        dstArray: Default::default(),
-        srcHost: Default::default(),
-        dstDevice: Default::default(),
-    };
-
-    unsafe {
-        cuMemcpy2DAsync_v2(&cpy, stream)
-            .result()
-            .map_err(|e| IoError::Unknown {
-                description: format!("CUDA 2D memcpy failed: {e}"),
-                backtrace: BackTrace::capture(),
-            })?;
-    }
-
-    Ok(())
+        Ok(())
 }

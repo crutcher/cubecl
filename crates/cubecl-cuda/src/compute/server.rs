@@ -2,7 +2,7 @@ use super::storage::gpu::{GpuResource, GpuStorage};
 use crate::{
     CudaCompiler,
     compute::{
-        command::{Command, write_to_cpu},
+        command::{Command, write_contiguous_bytes_to_cpu},
         context::CudaContext,
         stream::CudaStreamBackend,
         sync::Fence,
@@ -611,10 +611,7 @@ impl CudaServer {
         let stream_src = command_src.streams.current().sys;
 
         unsafe {
-            write_to_cpu(
-                &shape,
-                &strides,
-                elem_size,
+            write_contiguous_bytes_to_cpu(
                 &mut bytes,
                 resource_src.ptr,
                 stream_src,
